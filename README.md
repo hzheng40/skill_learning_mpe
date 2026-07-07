@@ -1,6 +1,6 @@
 # skill_learning_mpe
 
-Minimal JAX MAPPO baseline for five two-team MPE-style environments. The package exposes JAX-compatible environments, a feed-forward simultaneous self-play MAPPO trainer, and a static HTML evaluator with batched rollout selection and summary stats.
+Minimal JAX MAPPO baseline for two-team skill-learning environments. The package exposes JAX-compatible environments, a feed-forward simultaneous self-play MAPPO trainer, and a static HTML evaluator with batched rollout selection and summary stats.
 
 ## Install
 
@@ -38,6 +38,8 @@ Use the short `--env-key` names for normal runs. Each key maps to a default full
 | Key | Default env id | Description |
 | --- | --- | --- |
 | `ctf_buttons` | `simple_ctfbuttons_3v3_1obs_discrete_easy_0s_localobsv_random_v0` | Capture-the-flag with gated zone access. Agents must coordinate around buttons, flags, obstacles, and opposing-team pressure. |
+| `grid_ctf_buttons` | `simple_gridctfbuttons_3v3_1obs_15x9_discrete_random_v0` | Gridworld CTF with the same CTF-style state fields and event slots. Button pressing requires `noop` on the button cell; obstacles, contested cells, and direct swaps block movement. |
+| `area_denial` | `simple_areadenial_3v3_0obs_discrete_0s_random_v0` | Dense-reward area defense. Good agents defend a circular area while adversaries occupy it to accumulate reversible capture progress. |
 | `assembly_line` | `simple_assemblyline_3v3_discrete_0s_random_v0` | Teams collect parts from rooms, deliver them to an assembler, and use a button/hold mechanic to complete assembly. |
 | `king_of_hill` | `simple_kingofhill_3v3_discrete_0s_random_v0` | Teams contest hill ownership while using discrete movement/combat actions and respawn-style health mechanics. |
 | `payload_escort` | `simple_payload_3v3_discrete_0s_random_v0` | Teams push a shared payload toward their scoring side while button state and nearby agents affect movement. |
@@ -47,13 +49,21 @@ You can override the default with `--env-id` when you want a supported variant. 
 
 ```text
 simple_ctfbuttons_{A}v{B}_{N}obs_discrete_{easy|noobseasy|medium|hard}_{0s|gs}_{absobsv|relobsv|localobsv}_{random|static|everywhere}_v0
+simple_gridctfbuttons_{A}v{B}_{N}obs_{W}x{H}_discrete_{random|static}_v0
+simple_areadenial_{A}v{B}_{N}obs_discrete_{0s|gs}_{random|static|everywhere}_v0
 simple_payload_{A}v{B}_discrete_{0s|gs}_{random|static|everywhere}_v0
 simple_kingofhill_{A}v{B}_discrete_{0s|gs}_{random|static|everywhere}_v0
 simple_assemblyline_{A}v{B}_discrete_{0s|gs}_{random|static|everywhere}_v0
 simple_playground_{A}v{B}_discrete_v0
 ```
 
-`A` is the number of good agents and `B` is the number of adversaries. The current MAPPO scripts assume two teams and discrete actions.
+`A` is the number of good agents and `B` is the number of adversaries. `N` is the number of obstacles where the environment supports configurable obstacles. The current MAPPO scripts assume two teams and discrete actions.
+
+### New Environment Notes
+
+`grid_ctf_buttons` is a semantic gridworld version of CTF, not a physics-identical discretization of `ctf_buttons`. It preserves CTF-compatible state fields such as `p_pos`, `p_vel`, `flag_moving`, `flag_carrier`, `flag_p_pos`, `agent_zone`, `adversary_zone`, `obs_pos`, `button_pos`, and `prev_p_pos`. Its `info["subtask_obs"]` uses the same 10-slot CTF order: button press, opponent-zone entry/exit, own-zone entry/exit, flag carry/drop, obstacle collision, teammate collision, and opponent collision.
+
+`area_denial` is a continuous MPE-style defender/attacker task. `agent_*` are defenders, `adversary_*` are attackers, and attackers win by occupying the protected area until `control_progress >= 1.0`. Defenders win by preventing capture until timeout. V1 has dense rewards, reversible progress, and no combat/tagging. Its `info["subtask_obs"]` tracks area boundary/inside/entry/exit, opponent area presence, team progress direction, near-area blocking, and teammate/opponent collisions.
 
 ## Environment API
 
