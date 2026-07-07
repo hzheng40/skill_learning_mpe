@@ -50,7 +50,7 @@ You can override the default with `--env-id` when you want a supported variant. 
 ```text
 simple_ctfbuttons_{A}v{B}_{N}obs_discrete_{easy|noobseasy|medium|hard}_{0s|gs}_{absobsv|relobsv|localobsv}_{random|static|everywhere}_v0
 simple_gridctfbuttons_{A}v{B}_{N}obs_{W}x{H}_discrete_{random|static}_v0
-simple_areadenial_{A}v{B}_{N}obs_discrete_{0s|gs}_{random|static|everywhere}_v0
+simple_areadenial_{A}v{B}_{N}obs_discrete_{0s|gs}_{random|static|everywhere}[_ctrl-{direct|circle|split}]_v0
 simple_payload_{A}v{B}_discrete_{0s|gs}_{random|static|everywhere}_v0
 simple_kingofhill_{A}v{B}_discrete_{0s|gs}_{random|static|everywhere}_v0
 simple_assemblyline_{A}v{B}_discrete_{0s|gs}_{random|static|everywhere}_v0
@@ -64,6 +64,8 @@ simple_playground_{A}v{B}_discrete_v0
 `grid_ctf_buttons` is a semantic gridworld version of CTF, not a physics-identical discretization of `ctf_buttons`. It preserves CTF-compatible state fields such as `p_pos`, `p_vel`, `flag_moving`, `flag_carrier`, `flag_p_pos`, `agent_zone`, `adversary_zone`, `obs_pos`, `button_pos`, and `prev_p_pos`. Its `info["subtask_obs"]` uses the same 10-slot CTF order: button press, opponent-zone entry/exit, own-zone entry/exit, flag carry/drop, obstacle collision, teammate collision, and opponent collision.
 
 `area_denial` is a continuous MPE-style defender/attacker task. `agent_*` are defenders, `adversary_*` are attackers, and attackers win by occupying the protected area until `control_progress >= 1.0`. Defenders win by preventing capture until timeout. V1 has dense rewards, reversible progress, and no combat/tagging. Its `info["subtask_obs"]` tracks area boundary/inside/entry/exit, opponent area presence, team progress direction, near-area blocking, and teammate/opponent collisions.
+
+Area-denial attackers can optionally be scripted by adding `_ctrl-{mode}` before `_v0` in the env id. `ctrl-direct` sends every attacker toward the protected area, `ctrl-circle` sends attackers toward evenly spaced moving points around the area, and `ctrl-split` sends even-index attackers directly in while odd-index attackers circle. Scripted mode keeps adversaries in observations, rewards, logs, and rendering, but ignores supplied adversary actions; defender-only action dictionaries are accepted.
 
 ## Environment API
 
@@ -80,6 +82,15 @@ env = apply_wrappers(env, ["TeamWorldStateWrapper", "AdversarialLogWrapper"])
 key = jax.random.PRNGKey(0)
 obs, state = env.reset(key)
 actions = {agent: env.action_space(agent).sample(key) for agent in env.agents}
+obs, state, reward, done, info = env.step(key, state, actions)
+```
+
+For scripted area-denial attackers, you can pass only defender actions:
+
+```python
+env = make_env("simple_areadenial_3v3_0obs_discrete_0s_random_ctrl-direct_v0")
+obs, state = env.reset(key)
+actions = {agent: env.action_space(agent).sample(key) for agent in env.controlled_agents}
 obs, state, reward, done, info = env.step(key, state, actions)
 ```
 
@@ -101,6 +112,14 @@ Run with the config file:
 ```bash
 uv run python scripts/train_mappo.py   --config configs/mappo.yaml   --env-key ctf_buttons   --run-name ctf_buttons_mappo
 ```
+
+Train defenders against scripted area-denial attackers:
+
+```bash
+uv run python scripts/train_mappo.py   --env-key area_denial   --env-id simple_areadenial_3v3_0obs_discrete_0s_random_ctrl-split_v0   --run-name area_denial_defenders_vs_split   --num-envs 4   --num-steps 32
+```
+
+When scripted attackers are enabled, MAPPO optimizes only the defender policy. Adversary returns are still logged for evaluation.
 
 Outputs are written to `runs/<run-name>/`:
 

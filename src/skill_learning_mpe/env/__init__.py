@@ -111,13 +111,20 @@ def make_env(env_id: str) -> MultiAgentEnv:
         )
 
     if env_core == "simpleareadenial":
-        # simple_areadenial_{num_agents}v{num_adversaries}_{n}obs_{acttype}_{0s}_{randomstart}_v0
+        # simple_areadenial_{num_agents}v{num_adversaries}_{n}obs_{acttype}_{0s}_{randomstart}[_ctrl-{mode}]_v0
         num_ag, num_adv = args[2].split("v")
         num_obs = int(args[3].replace("obs", ""))
         act_type = args[4].capitalize()
         zero_sum = args[5] == "0s"
         random_start = args[6] != "static"
         init_agent_everywhere = random_start and args[6] == "everywhere"
+        attacker_controller_mode = None
+        if len(args) == 9:
+            if not args[7].startswith("ctrl-"):
+                raise ValueError(f"Unknown area-denial controller segment in env id: {env_id}")
+            attacker_controller_mode = args[7].replace("ctrl-", "", 1)
+        elif len(args) != 8:
+            raise ValueError(f"Invalid area-denial environment id: {env_id}")
         return SimpleAreaDenial(
             num_good_agents=int(num_ag),
             num_adversaries=int(num_adv),
@@ -130,6 +137,7 @@ def make_env(env_id: str) -> MultiAgentEnv:
             zero_sum=zero_sum,
             random_start=random_start,
             init_agent_everywhere=init_agent_everywhere,
+            attacker_controller_mode=attacker_controller_mode,
         )
 
     if env_core == "simplepayload":

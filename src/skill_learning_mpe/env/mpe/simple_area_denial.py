@@ -16,6 +16,9 @@ from .simple import SimpleMPE
 from .simple import State as SimpleState
 
 
+ATTACKER_CONTROLLER_MODES = ("direct", "circle", "split")
+
+
 @struct.dataclass
 class State:
     """Area-denial state with fixed-shape MPE fields."""
@@ -66,8 +69,17 @@ class SimpleAreaDenial(SimpleMPE):
         num_skills: int = 10,
         random_skills: bool = False,
         assign_subtasks: bool = False,
+        attacker_controller_mode: str | None = None,
         **_: object,
     ):
+        if attacker_controller_mode in ("", "none", "None"):
+            attacker_controller_mode = None
+        if attacker_controller_mode not in (None, *ATTACKER_CONTROLLER_MODES):
+            modes = ", ".join(ATTACKER_CONTROLLER_MODES)
+            raise ValueError(
+                f"Unknown attacker controller mode '{attacker_controller_mode}'. "
+                f"Available modes: {modes}"
+            )
         self.num_good_agents = int(num_good_agents)
         self.num_adversaries = int(num_adversaries)
         self.num_actors = self.num_good_agents + self.num_adversaries
@@ -86,6 +98,7 @@ class SimpleAreaDenial(SimpleMPE):
         self.zero_sum = bool(zero_sum)
         self.random_start = bool(random_start)
         self.init_agent_everywhere = bool(init_agent_everywhere)
+        self.attacker_controller_mode = attacker_controller_mode
         self.max_steps = CTF_MAX_STEPS
 
         self.num_skills = int(num_skills)
@@ -160,6 +173,22 @@ class SimpleAreaDenial(SimpleMPE):
             max_speed=max_speed,
             max_steps=self.max_steps,
         )
+
+    @property
+    def scripted_attackers_enabled(self) -> bool:
+        return self.attacker_controller_mode is not None
+
+    @property
+    def controlled_agents(self) -> List[str]:
+        if self.scripted_attackers_enabled:
+            return self.good_agents
+        return self.agents
+
+    @property
+    def scripted_agents(self) -> List[str]:
+        if self.scripted_attackers_enabled:
+            return self.adversaries
+        return []
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
@@ -255,8 +284,9 @@ class SimpleAreaDenial(SimpleMPE):
             goal=None,
             c=jnp.zeros((self.num_actors, self.dim_c)),
         )
+        step_actions = self._with_scripted_attacker_actions(state, actions)
         _, simple_state, _, simple_dones, _ = SimpleMPE.step_env(
-            self, key, simple_state, actions
+            self, key, simple_state, step_actions
         )
 
         next_p_pos = simple_state.p_pos[: self.num_actors]
@@ -306,6 +336,9 @@ class SimpleAreaDenial(SimpleMPE):
                 name: normalized_cum[idx] for idx, name in enumerate(self.agents)
             },
             "option_assignment": state.option_assignment,
+            "scripted_attackers_enabled": jnp.asarray(
+                self.scripted_attackers_enabled, dtype=bool
+            ),
         }
 
         if not self.random_skills and self.assign_subtasks:
@@ -325,6 +358,73 @@ class SimpleAreaDenial(SimpleMPE):
 
         state = state.replace(prev_p_pos=prev_p_pos)
         return self.obs_fn(state), state, rewards, dones, info
+
+    def _with_scripted_attacker_actions(
+        self, state: State, actions: Dict[str, chex.Array]
+    ) -> Dict[str, chex.Array]:
+        if not self.scripted_attackers_enabled:
+            return actions
+        scripted_actions = self.scripted_attacker_actions(state)
+        return {
+            **{agent: actions[agent] for agent in self.good_agents},
+            **{
+                agent: scripted_actions[idx]
+                for idx, agent in enumerate(self.adversaries)
+            },
+        }
+
+    @partial(jax.jit, static_argnums=(0,))
+    def scripted_attacker_actions(self, state: State) -> chex.Array:
+        desired = self._scripted_attacker_desired_vectors(state)
+        if self.action_type == DISCRETE_ACT:
+            return self._desired_vectors_to_discrete_actions(desired)
+        return self._desired_vectors_to_continuous_actions(desired)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _scripted_attacker_desired_vectors(self, state: State) -> chex.Array:
+        attacker_pos = state.p_pos[self.num_good_agents :]
+        direct = state.area_pos - attacker_pos
+        circle = self._circle_controller_desired_vectors(state, attacker_pos)
+        if self.attacker_controller_mode == "direct":
+            return direct
+        if self.attacker_controller_mode == "circle":
+            return circle
+        use_direct = (jnp.arange(self.num_adversaries) % 2) == 0
+        return jnp.where(use_direct[:, None], direct, circle)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _circle_controller_desired_vectors(
+        self, state: State, attacker_pos: chex.Array
+    ) -> chex.Array:
+        idx = jnp.arange(self.num_adversaries, dtype=jnp.float32)
+        base = 2.0 * jnp.pi * idx / jnp.maximum(float(self.num_adversaries), 1.0)
+        phase = base + 0.05 * state.step.astype(jnp.float32)
+        radius = self.area_radius + 2.0 * self.agent_size
+        targets = state.area_pos + radius * jnp.stack(
+            (jnp.cos(phase), jnp.sin(phase)), axis=1
+        )
+        return targets - attacker_pos
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _desired_vectors_to_discrete_actions(self, desired: chex.Array) -> chex.Array:
+        abs_desired = jnp.abs(desired)
+        use_x = abs_desired[:, 0] >= abs_desired[:, 1]
+        x_action = jnp.where(desired[:, 0] >= 0.0, 2, 1)
+        y_action = jnp.where(desired[:, 1] >= 0.0, 4, 3)
+        moving = jnp.linalg.norm(desired, axis=1) > 1e-6
+        action = jnp.where(use_x, x_action, y_action)
+        return jnp.where(moving, action, 0).astype(jnp.int32)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _desired_vectors_to_continuous_actions(self, desired: chex.Array) -> chex.Array:
+        norm = jnp.linalg.norm(desired, axis=1, keepdims=True)
+        direction = desired / jnp.maximum(norm, 1e-6)
+        action = jnp.zeros((self.num_adversaries, 5), dtype=jnp.float32)
+        action = action.at[:, 1].set(jnp.clip(-direction[:, 0], 0.0, 1.0))
+        action = action.at[:, 2].set(jnp.clip(direction[:, 0], 0.0, 1.0))
+        action = action.at[:, 3].set(jnp.clip(-direction[:, 1], 0.0, 1.0))
+        action = action.at[:, 4].set(jnp.clip(direction[:, 1], 0.0, 1.0))
+        return action
 
     @partial(jax.jit, static_argnums=(0,))
     def subtask_obs_fn(

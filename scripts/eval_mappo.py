@@ -78,18 +78,20 @@ def rollout(config: Dict[str, Any], args: argparse.Namespace):
     rng = jax.random.PRNGKey(config["SEED"])
     base_env = make_env(config["ENV_NAME"])
     env = apply_wrappers(base_env, config.get("ENV_WRAPPERS", DEFAULT_WRAPPERS))
+    scripted_attackers = bool(getattr(env, "scripted_attackers_enabled", False))
+    policy_agents = env.controlled_agents if scripted_attackers else env.agents
     rng, reset_rng = jax.random.split(rng)
     reset_rngs = jax.random.split(reset_rng, args.num_evals)
     obs, env_state = jax.vmap(env.reset)(reset_rngs)
 
-    actor = ActorFF(env.action_space(env.agents[0]).n, config=config)
+    actor = ActorFF(env.action_space(policy_agents[0]).n, config=config)
     if args.random_policy:
         rng, init_rng = jax.random.split(rng)
         init_x = jnp.zeros(
-            (1, args.num_evals, env.observation_space(env.agents[0]).shape[0])
+            (1, args.num_evals, env.observation_space(policy_agents[0]).shape[0])
         )
         actor_params = actor.init(init_rng, init_x)
-        adv_actor_params = actor_params
+        adv_actor_params = None if scripted_attackers else actor_params
     else:
         actor_path = args.actor_path or (
             args.run_dir / "actor.safetensors" if args.run_dir else None
@@ -98,7 +100,7 @@ def rollout(config: Dict[str, Any], args: argparse.Namespace):
             raise ValueError("Provide --run-dir, --actor-path, or use --random-policy")
         adv_actor_path = args.adv_actor_path or actor_path
         actor_params = load_params(actor_path)
-        adv_actor_params = load_params(adv_actor_path)
+        adv_actor_params = None if scripted_attackers else load_params(adv_actor_path)
 
     def _env_step(runner_state, unused):
         env_state, last_obs, rng = runner_state
@@ -113,19 +115,23 @@ def rollout(config: Dict[str, Any], args: argparse.Namespace):
             args.num_evals,
             ag_rng,
         )
-        adv_act = _policy_actions(
-            env,
-            config,
-            actor,
-            adv_actor_params,
-            last_obs,
-            env.adversaries,
-            args.num_evals,
-            adv_rng,
-        )
+        if scripted_attackers:
+            env_actions = ag_act
+        else:
+            adv_act = _policy_actions(
+                env,
+                config,
+                actor,
+                adv_actor_params,
+                last_obs,
+                env.adversaries,
+                args.num_evals,
+                adv_rng,
+            )
+            env_actions = ag_act | adv_act
         step_rngs = jax.random.split(step_rng, args.num_evals)
         obs, env_state, reward, done, info = jax.vmap(env.step)(
-            step_rngs, env_state, ag_act | adv_act
+            step_rngs, env_state, env_actions
         )
         transition = (env_state.env_state, reward, done, info)
         return (env_state, obs, rng), transition
@@ -197,6 +203,8 @@ def main() -> None:
             "num_evals": args.num_evals,
             "initial_episode_index": args.episode_index,
             "policy": "random" if args.random_policy else "checkpoint",
+            "scripted_attackers": bool(getattr(env, "scripted_attackers_enabled", False)),
+            "attacker_controller_mode": getattr(env, "attacker_controller_mode", None),
         },
         title=title,
     )

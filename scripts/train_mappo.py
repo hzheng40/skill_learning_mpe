@@ -96,9 +96,14 @@ def _json_ready(value: Any) -> Any:
 
 def make_train(config: Dict[str, Any], metrics_path: Path, use_wandb: bool = False):
     env = apply_wrappers(make_env(config["ENV_NAME"]), config["ENV_WRAPPERS"])
-    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+    scripted_attackers = bool(getattr(env, "scripted_attackers_enabled", False))
+    train_agents = env.controlled_agents if scripted_attackers else env.agents
+    config["SCRIPTED_ATTACKERS"] = scripted_attackers
+    config["NUM_ACTORS"] = len(train_agents) * config["NUM_ENVS"]
     config["AG_NUM_ACTORS"] = env.num_good_agents * config["NUM_ENVS"]
-    config["ADV_NUM_ACTORS"] = env.num_adversaries * config["NUM_ENVS"]
+    config["ADV_NUM_ACTORS"] = (
+        0 if scripted_attackers else env.num_adversaries * config["NUM_ENVS"]
+    )
     config["NUM_UPDATES"] = max(
         1, config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -130,12 +135,12 @@ def make_train(config: Dict[str, Any], metrics_path: Path, use_wandb: bool = Fal
         return config["LR"] * frac
 
     def train(rng: chex.PRNGKey):
-        actor_network = ActorFF(env.action_space(env.agents[0]).n, config=config)
+        actor_network = ActorFF(env.action_space(train_agents[0]).n, config=config)
         critic_network = CriticFF(config=config)
 
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
         ac_init_x = jnp.zeros(
-            (1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])
+            (1, config["NUM_ENVS"], env.observation_space(train_agents[0]).shape[0])
         )
         actor_params = actor_network.init(actor_rng, ac_init_x)
         cr_init_x = jnp.zeros((1, config["NUM_ENVS"], env.agent_world_state_size()))
@@ -167,53 +172,86 @@ def make_train(config: Dict[str, Any], metrics_path: Path, use_wandb: bool = Fal
 
                 rng, ag_rng, adv_rng, step_rng = jax.random.split(rng, 4)
                 ag_obs = batchify(last_obs, env.good_agents, config["AG_NUM_ACTORS"])
-                adv_obs = batchify(last_obs, env.adversaries, config["ADV_NUM_ACTORS"])
 
                 ag_pi = actor_network.apply(actor_ts.params, ag_obs[np.newaxis, :])
                 ag_action = ag_pi.sample(seed=ag_rng)
                 ag_log_prob = ag_pi.log_prob(ag_action)
+                ag_action_flat = ag_action.squeeze()
+                ag_log_prob_flat = ag_log_prob.squeeze()
                 ag_env_act = unbatchify(
                     ag_action, env.good_agents, config["NUM_ENVS"], env.num_good_agents
                 )
 
-                adv_pi = actor_network.apply(actor_ts.params, adv_obs[np.newaxis, :])
-                adv_action = adv_pi.sample(seed=adv_rng)
-                adv_log_prob = adv_pi.log_prob(adv_action)
-                adv_env_act = unbatchify(
-                    adv_action,
-                    env.adversaries,
-                    config["NUM_ENVS"],
-                    env.num_adversaries,
-                )
-
                 ag_world_state = last_obs["agent_world_state"].swapaxes(0, 1)
                 ag_world_state = ag_world_state.reshape((config["AG_NUM_ACTORS"], -1))
-                adv_world_state = last_obs["adversary_world_state"].swapaxes(0, 1)
-                adv_world_state = adv_world_state.reshape((config["ADV_NUM_ACTORS"], -1))
-
                 ag_value = critic_network.apply(critic_ts.params, ag_world_state[None, :])
-                adv_value = critic_network.apply(critic_ts.params, adv_world_state[None, :])
+
+                if scripted_attackers:
+                    adv_action_flat = jnp.zeros((0,), dtype=ag_action_flat.dtype)
+                    adv_log_prob_flat = jnp.zeros((0,), dtype=ag_log_prob_flat.dtype)
+                    adv_value = jnp.zeros((0,), dtype=ag_value.dtype)
+                    adv_obs = jnp.zeros((0, ag_obs.shape[-1]), dtype=ag_obs.dtype)
+                    adv_world_state = jnp.zeros(
+                        (0, ag_world_state.shape[-1]), dtype=ag_world_state.dtype
+                    )
+                    env_actions = ag_env_act
+                else:
+                    adv_obs = batchify(
+                        last_obs, env.adversaries, config["ADV_NUM_ACTORS"]
+                    )
+                    adv_pi = actor_network.apply(actor_ts.params, adv_obs[np.newaxis, :])
+                    adv_action = adv_pi.sample(seed=adv_rng)
+                    adv_log_prob = adv_pi.log_prob(adv_action)
+                    adv_action_flat = adv_action.squeeze()
+                    adv_log_prob_flat = adv_log_prob.squeeze()
+                    adv_env_act = unbatchify(
+                        adv_action,
+                        env.adversaries,
+                        config["NUM_ENVS"],
+                        env.num_adversaries,
+                    )
+                    adv_world_state = last_obs["adversary_world_state"].swapaxes(0, 1)
+                    adv_world_state = adv_world_state.reshape(
+                        (config["ADV_NUM_ACTORS"], -1)
+                    )
+                    adv_value = critic_network.apply(
+                        critic_ts.params, adv_world_state[None, :]
+                    )
+                    env_actions = ag_env_act | adv_env_act
 
                 step_rngs = jax.random.split(step_rng, config["NUM_ENVS"])
                 next_obs, next_env_state, reward, done, info = jax.vmap(env.step)(
-                    step_rngs, env_state, ag_env_act | adv_env_act
+                    step_rngs, env_state, env_actions
                 )
                 info = jax.tree.map(lambda x: x.flatten(), info)
                 ag_done = batchify(done, env.good_agents, config["AG_NUM_ACTORS"]).squeeze()
-                adv_done = batchify(done, env.adversaries, config["ADV_NUM_ACTORS"]).squeeze()
+                adv_done = (
+                    jnp.zeros((0,), dtype=ag_done.dtype)
+                    if scripted_attackers
+                    else batchify(
+                        done, env.adversaries, config["ADV_NUM_ACTORS"]
+                    ).squeeze()
+                )
+                adv_reward = (
+                    jnp.zeros((0,), dtype=jnp.asarray(reward[env.good_agents[0]]).dtype)
+                    if scripted_attackers
+                    else batchify(
+                        reward, env.adversaries, config["ADV_NUM_ACTORS"]
+                    ).squeeze()
+                )
 
                 transition = Transition(
-                    jnp.tile(done["__all__"], env.num_agents),
+                    jnp.tile(done["__all__"], len(train_agents)),
                     jnp.concatenate((ag_last_done, adv_last_done)),
-                    jnp.concatenate((ag_action.squeeze(), adv_action.squeeze())),
+                    jnp.concatenate((ag_action_flat, adv_action_flat)),
                     jnp.concatenate((ag_value.squeeze(), adv_value.squeeze())),
                     jnp.concatenate(
                         (
                             batchify(reward, env.good_agents, config["AG_NUM_ACTORS"]).squeeze(),
-                            batchify(reward, env.adversaries, config["ADV_NUM_ACTORS"]).squeeze(),
+                            adv_reward,
                         )
                     ),
-                    jnp.concatenate((ag_log_prob.squeeze(), adv_log_prob.squeeze())),
+                    jnp.concatenate((ag_log_prob_flat, adv_log_prob_flat)),
                     jnp.vstack((ag_obs, adv_obs)),
                     jnp.vstack((ag_world_state, adv_world_state)),
                     info,
@@ -236,14 +274,24 @@ def make_train(config: Dict[str, Any], metrics_path: Path, use_wandb: bool = Fal
 
             ag_last_world_state = last_obs["agent_world_state"].swapaxes(0, 1)
             ag_last_world_state = ag_last_world_state.reshape((config["AG_NUM_ACTORS"], -1))
-            adv_last_world_state = last_obs["adversary_world_state"].swapaxes(0, 1)
-            adv_last_world_state = adv_last_world_state.reshape((config["ADV_NUM_ACTORS"], -1))
-            last_val = jnp.concatenate(
-                (
-                    critic_network.apply(critic_ts.params, ag_last_world_state[None, :]).squeeze(),
-                    critic_network.apply(critic_ts.params, adv_last_world_state[None, :]).squeeze(),
+            ag_last_val = critic_network.apply(
+                critic_ts.params, ag_last_world_state[None, :]
+            ).squeeze()
+            if scripted_attackers:
+                last_val = ag_last_val
+            else:
+                adv_last_world_state = last_obs["adversary_world_state"].swapaxes(0, 1)
+                adv_last_world_state = adv_last_world_state.reshape(
+                    (config["ADV_NUM_ACTORS"], -1)
                 )
-            )
+                last_val = jnp.concatenate(
+                    (
+                        ag_last_val,
+                        critic_network.apply(
+                            critic_ts.params, adv_last_world_state[None, :]
+                        ).squeeze(),
+                    )
+                )
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):

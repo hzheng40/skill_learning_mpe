@@ -12,6 +12,7 @@ TEAM_COLORS = {"agent": "#2563eb", "adversary": "#dc2626"}
 PLOT_SIZE_PX = 720
 
 POSITION_FIELDS = [
+    "area_pos",
     "agent_zone",
     "adversary_zone",
     "agent_goal_zone",
@@ -31,6 +32,7 @@ POSITION_FIELDS = [
     "assembly_button_pos",
 ]
 STATE_FIELDS = POSITION_FIELDS + ["p_pos", "payload_button_toggled", "button_toggled"]
+MAX_RENDER_COORD_ABS = 1e5
 
 
 def _array(value: Any) -> np.ndarray:
@@ -58,7 +60,12 @@ def _position_fields(state: Any, episode_index: int) -> list[np.ndarray]:
         except Exception:
             continue
         if arr.ndim >= 2 and arr.shape[-1] == 2:
-            fields.append(arr.reshape(-1, 2))
+            points = arr.reshape(-1, 2)
+            valid = np.isfinite(points).all(axis=1) & (
+                np.abs(points) < MAX_RENDER_COORD_ABS
+            ).all(axis=1)
+            if np.any(valid):
+                fields.append(points[valid])
     return fields
 
 
@@ -321,6 +328,7 @@ def render_batch_trajectory_html(
     assembler: "#22c55e",
     assemblyButton: "#14b8a6",
     grid: "#e5e7eb",
+    area: "#0f766e",
     text: "#111827"
   }};
 
@@ -333,8 +341,9 @@ def render_batch_trajectory_html(
   }}
   function asPoints(value) {{
     if (!value) return [];
-    if (Array.isArray(value[0]) && typeof value[0][0] === "number") return value;
-    if (typeof value[0] === "number") return [value];
+    const validPoint = (xy) => Array.isArray(xy) && xy.length >= 2 && Number.isFinite(xy[0]) && Number.isFinite(xy[1]) && Math.abs(xy[0]) < 100000 && Math.abs(xy[1]) < 100000;
+    if (Array.isArray(value[0]) && typeof value[0][0] === "number") return value.filter(validPoint);
+    if (typeof value[0] === "number" && validPoint(value)) return [value];
     return [];
   }}
   function asList(value) {{
@@ -424,6 +433,8 @@ def render_batch_trajectory_html(
     const env = data.env;
     drawGrid();
 
+    const area = fieldAt("area_pos");
+    if (area) drawCircle(area, env.zoneSize, colors.area, "protected_area", 0.12, colors.area, 18);
     const agentZone = fieldAt("agent_zone");
     if (agentZone) drawCircle(agentZone, env.zoneSize, colors.agent, "agent_zone", 0.08, colors.agent, 18);
     const adversaryZone = fieldAt("adversary_zone");
